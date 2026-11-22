@@ -1,0 +1,12 @@
+{
+  "name": "magicmtn-chat-realtime",
+  "model": "org/served-model",
+  "configuration": {
+    "mode": "realtime",
+    "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/sagemaker-chat:1",
+    "execution_role_arn": "arn:aws:iam::123456789012:role/SageMakerInference",
+    "model_data_url": "s3://your-model-bucket/model.tar.gz",
+    "instance_type": "ml.g5.xlarge",
+    "initial_instance_count": 1
+  }
+}

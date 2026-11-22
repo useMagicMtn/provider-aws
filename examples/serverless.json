@@ -1,0 +1,12 @@
+{
+  "name": "magicmtn-chat-serverless",
+  "model": "org/small-cpu-model",
+  "configuration": {
+    "mode": "serverless",
+    "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/sagemaker-chat-cpu:1",
+    "execution_role_arn": "arn:aws:iam::123456789012:role/SageMakerInference",
+    "model_data_url": "s3://your-model-bucket/small-model.tar.gz",
+    "memory_size_mb": 6144,
+    "max_concurrency": 10
+  }
+}

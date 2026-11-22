@@ -1,0 +1,2 @@
+# First version verified here with the lambda-microvms service model.
+boto3[crt]>=1.43.111,<1.44

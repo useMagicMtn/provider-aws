@@ -1,0 +1,51 @@
+[package]
+name = "magicmtn-provider-aws"
+version = "0.1.4"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "AWS Bedrock inference, Lambda MicroVM and Nitro sandboxing, and SageMaker inference for MagicMtn"
+readme = "README.md"
+include = [
+    "src/**/*.rs",
+    "src/**/*.py",
+    "sandbox/agent.py",
+    "sandbox/Dockerfile",
+    "examples/*.json",
+    "tests/**/*.rs",
+    "tests/**/*.py",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "CONTRIBUTING.md",
+    "USAGE.md",
+    ".github/assets/logo-light.svg",
+    ".github/assets/logo-dark.svg",
+    "AGENTS.md",
+    ".cargo/config.toml.example",
+    "requirements.txt",
+    "package.sh",
+]
+
+[[bin]]
+name = "magicmtn-provider-aws"
+path = "src/main.rs"
+required-features = ["plugin"]
+
+[features]
+default = ["plugin"]
+bedrock-only = []
+plugin = ["dep:clap", "tokio/macros", "tokio/rt"]
+
+[dependencies]
+magicmtn-sdk = "0.1.0"
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "time"] }
+
+clap = { version = "4", features = ["derive"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+magicmtn-provider-framework = { version = "0.1.0", features = ["host"] }

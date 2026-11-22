@@ -1,0 +1,10 @@
+/target/
+/dist/
+/.venv/
+__pycache__/
+*.pyc
+/magicmtn-agent.zip
+/setup.env.sh
+/.local/
+/.cargo/config.toml
+.DS_Store
