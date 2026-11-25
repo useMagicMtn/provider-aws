@@ -2,12 +2,12 @@
 
 ## Host configuration
 
-Set configuration on the provider host and restart long-running hosts after changing their environment. Keep credentials out of model parameters, RPC payloads, deployment specifications, archives, and logs.
+Set configuration on the provider host and restart long-running hosts after changing their environment. Keep credentials out of model parameters, operation RPC payloads, deployment specifications, archives, and logs. The MagicMtn broker sends credentials only through the private startup exchange.
 
 | Variable                                         | Purpose                                                                                                                                             |
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `MAGICMTN_AWS_PYTHON`                            | Python interpreter containing Boto3; defaults to `python3`.                                                                                         |
-| `AWS_PROFILE`, standard AWS credential variables | Boto3's host credential chain. Workload roles are supported.                                                                                        |
+| `AWS_PROFILE`, standard AWS credential variables | Boto3’s host credential chain for direct use and protocol v1. Workload roles are supported.                                                                                        |
 | `AWS_REGION`, `AWS_DEFAULT_REGION`               | Bedrock checks these in that order and defaults to `us-east-2`. Other services use Boto3 region resolution; set `AWS_DEFAULT_REGION` for local use. |
 | `MAGICMTN_AWS_BEDROCK_ROLE_ARN`                  | Role assumed for Bedrock; mandatory for `bedrock-only` requests. Also prevents SageMaker inference through this adapter.                            |
 | `MAGICMTN_AWS_MICROVM_IMAGES`                    | JSON map from exact OCI image references to prebuilt Lambda MicroVM image identifiers, preferably version-pinned.                                   |
@@ -18,7 +18,13 @@ Set configuration on the provider host and restart long-running hosts after chan
 | `MAGICMTN_AWS_NITRO_EKS_NAMESPACE`               | Nitro workload namespace; defaults to `magicmtn-sandboxes`.                                                                                         |
 | `MAGICMTN_AWS_KUBECTL`                           | Path to `kubectl` on the provider host; defaults to `kubectl`.                                                                                      |
 
-Discovery does not start Python, read credentials, or call AWS. Credentials and STS sessions remain in the adapter process; they are never returned or persisted. Configured AWS endpoint overrides are ignored.
+Discovery does not start Python, read credentials, or call AWS. Credentials remain on the host; they are never returned by the provider or persisted by the adapter. Configured AWS endpoint overrides are ignored.
+
+## Provider credentials
+
+Registry packages declare protocol v2 and require a credential bundle with exactly `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Supply those string fields in a private JSON file to `magic --local provider configure aws --secret-file <path>`. The broker verifies the AWS account through signed STS `GetCallerIdentity`, pins its 12-digit account ID, encrypts the local bundle, and passes the admitted version through the provider's private startup frame. New operations use the rotated bundle when the broker publishes it. The provider uses those explicit keys for all Boto3 clients, including the STS role assumption used for Bedrock; it never falls back to ambient credentials in a broker session.
+
+The current SDK credential declaration requires an exact set of non-empty fields. The broker bundle therefore supports access-key pairs, while temporary session credentials, profiles, and workload roles remain supported through direct library/CLI use and protocol v1's host chain. Configure the AWS region and service-specific non-secret settings on the connection. The Python interpreter with Boto3 must be available to the provider host; the broker host runs installed providers in an isolated environment. For a local MagicMtn host, set `MAGICMTN_AWS_PYTHON` to the absolute interpreter path and `MAGICMTN_AWS_KUBECTL` to the absolute `kubectl` path if it is not on the host PATH.
 
 ## Inference
 
@@ -44,7 +50,7 @@ Send a chat request with your Bedrock inference profile.
 
 Use a `us.openai.*` inference profile available to your AWS account. The provider sends signed `InvokeModel` requests to `us-east-2` (Ohio) for US cross-region inference. Supply at most one of `max_tokens` and `max_completion_tokens`. Both set the completion token limit.
 
-If configured, the data-plane role is assumed using the host credential chain with a 900-second STS session. Each invocation resolves credentials afresh. Grant invocation permissions for the selected profile and its destination models.
+If configured, the data-plane role is assumed using the admitted broker credential or the direct host credential chain with a 900-second STS session. Each invocation resolves that role session afresh. Grant invocation permissions for the selected profile and its destination models.
 
 ### SageMaker
 
@@ -128,11 +134,13 @@ export MAGICMTN_AWS_SANDBOX_BACKEND=nitro-eks
 export MAGICMTN_AWS_NITRO_EKS_CLUSTER=agent-sandboxes
 ```
 
-The IAM role needs `eks:DescribeCluster` for the selected cluster. Boto3 uses the host credential chain to sign a short-lived, cluster-bound STS identity token. The provider fetches the endpoint and CA from EKS for each operation and sends the exec token through a private pipe to `kubectl`. Secrets stay on the host.
+The IAM role needs `eks:DescribeCluster` for the selected cluster. Boto3 uses the admitted broker credential or the direct host credential chain to sign a short-lived, cluster-bound STS identity token. The provider fetches the endpoint and CA from EKS for each operation and sends the exec token through a private pipe to `kubectl`. Secrets stay on the host.
 
 Select provider `aws` and the agent OCI image in MagicMtn. The host backend setting routes `image:<OCI reference>|<session UUID>` to Nitro EKS. Direct callers can select `nitro-eks:<OCI reference>|<session UUID>` explicitly. `microvm:` templates retain their Lambda routing. Existing sandbox IDs retain their backend when the host default changes.
 
-Each session has a deterministic Job name. Repeating create reconciles an existing provider-owned Job with matching configuration. Create returns its scoped ID and `PENDING`. Exec polls readiness for up to 15 seconds. Preserve the returned ID: it includes account, region, cluster, namespace, and Kubernetes UID. Terminate checks that identity and deletes the Job and its pods together.
+Each session has a deterministic Job name. Repeating create reconciles an existing provider-owned Job with matching configuration. Create returns its scoped ID and `PENDING`. Exec waits up to 45 seconds, including cluster discovery, for an owned Pod with a ready `sandbox` container. It uses a scoped Pod list/watch, falling back to polling if the existing Role lacks watch permission. Reapply `kubectl apply -f examples/nitro-eks-rbac.json` to enable watches. The command has its own timeout after startup, and the provider checks the Job and Pod identities again before sending it. Preserve the returned ID: it includes account, region, cluster, namespace, and Kubernetes UID. Terminate checks that identity and deletes the Job and its pods together.
+
+If startup expires, the provider reports the last observed scheduling constraint or image-pull blocker, or `Nitro sandbox is not ready` if neither was observed. A removed or terminating Job fails immediately; `sandbox lifetime expired` indicates its deadline was exceeded. These readiness errors occur before command submission. A command transport failure after submission is not replayed. Cold node provisioning may still exceed 45 seconds; the Job remains available until its lifetime expires.
 
 Jobs use a one-vCPU, 512-MiB container, `restartPolicy: Never`, and a zero retry budget. The requested lifetime becomes `activeDeadlineSeconds`, capped at eight hours and defaulting to eight hours. Kubernetes removes finished Jobs and their pods after five minutes. Lifetime enforcement continues independently of the provider process.
 
@@ -144,4 +152,4 @@ The host needs `lambda:RunMicrovm`, `lambda:GetMicrovm`, `lambda:TerminateMicrov
 
 SageMaker invocation needs `sagemaker:InvokeEndpoint`. Lifecycle needs Create/Describe/DeleteModel, Create/Describe/DeleteEndpointConfig, Create/Describe/DeleteEndpoint, AddTags/ListTags, and `iam:PassRole`. Its execution role needs access to the container image, model artifact, and container resources. Bedrock needs invocation permissions on the selected profiles and destination models. The host also needs permission to assume the configured data-plane role. AWS enforces regional availability, quotas, and account access at operation time.
 
-Mutations, inference, and command execution have automatic retries disabled. Only read-only readiness/state polling repeats. Reconcile actual remote state after a lost response or timeout before retrying. The adapter deadline is 100 seconds. Set the caller RPC deadline to allow time for the operation. Inference inputs are bounded at 4 MiB and raw responses at 768 KiB to fit the SDK's 1 MiB RPC frame. Error messages omit upstream bodies, credentials, tokens, and prompts.
+Mutations, inference, and command execution have automatic retries disabled. Only read-only readiness/state polling repeats. Reconcile actual remote state after a lost response or timeout before retrying. The adapter deadline is 100 seconds. Allow at least 100 seconds for Nitro EKS exec RPCs, independent of the command timeout; the MagicMtn host uses 110 seconds. Inference inputs are bounded at 4 MiB and raw responses at 768 KiB to fit the SDK's 1 MiB RPC frame. Error messages omit upstream bodies, credentials, tokens, and prompts.

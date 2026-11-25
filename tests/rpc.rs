@@ -254,7 +254,7 @@ with tarfile.open(archive) as package:
     manifest = json.load(package.extractfile("package.json"))
     binary = package.extractfile("provider").read()
     assert hashlib.sha256(binary).hexdigest() == manifest["sha256"]
-    assert manifest["name"] == "aws" and manifest["protocol_version"] == 1
+    assert manifest["name"] == "aws" and manifest["protocol_version"] == 2
     root.mkdir()
     (root / "package.json").write_text(json.dumps(manifest))
     (root / "provider").write_bytes(binary)
@@ -263,7 +263,7 @@ with tarfile.open(archive) as package:
     (root / "provider").chmod(mode)
 "#,
     ])
-    .arg(archive)
+    .arg(&archive)
     .arg(&root)
     .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("LICENSE"))
     .status()
@@ -274,23 +274,91 @@ with tarfile.open(archive) as package:
     assert_eq!(package["version"], magicmtn_provider_aws::VERSION);
     assert_eq!(package["os"], std::env::consts::OS);
     assert_eq!(package["arch"], std::env::consts::ARCH);
-    let client = magicmtn_provider_framework::host::Client::start(&root.join("provider"), "aws")
+    let registry = magicmtn_provider_framework::host::Registry::new(root.join("registry")).unwrap();
+    let installed = registry
+        .install(&std::fs::read(&archive).unwrap())
         .await
         .unwrap();
     assert_eq!(
-        client.manifest.provider_version,
+        installed.package.protocol_version,
+        CREDENTIAL_PROTOCOL_VERSION
+    );
+    assert_eq!(
+        installed.manifest.provider_version,
         magicmtn_provider_aws::VERSION
     );
-    assert_eq!(client.manifest.capabilities.sandbox_operations.len(), 4);
     assert_eq!(
-        client
+        installed.manifest.credential,
+        Some(magicmtn_provider_aws::AwsProvider::credential_spec())
+    );
+    assert_eq!(installed.manifest.capabilities.sandbox_operations.len(), 4);
+    assert_eq!(
+        installed
             .manifest
             .capabilities
             .inference_deployment_operations
             .len(),
         5
     );
-    assert_eq!(client.manifest.capabilities.inference_tasks, vec!["chat"]);
+    assert_eq!(
+        installed.manifest.capabilities.inference_tasks,
+        vec!["chat"]
+    );
+    // Exercise the actual host's verification, admission and credentialed client,
+    // not only a direct startup frame. All AWS calls use the subprocess fixture.
+    use magicmtn_provider_framework::host::{
+        CredentialRef, PreparedCredential, ProcessEnvironment,
+    };
+    let credential = CredentialValues(std::collections::BTreeMap::from([
+        ("AWS_ACCESS_KEY_ID".into(), "test-key".into()),
+        ("AWS_SECRET_ACCESS_KEY".into(), "test-secret".into()),
+    ]));
+    let environment = ProcessEnvironment {
+        values: std::collections::BTreeMap::from([(
+            "MAGICMTN_AWS_PYTHON".into(),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-python.py").into(),
+        )]),
+    };
+    let pin = installed.pin();
+    let account = registry
+        .verify_credential(&pin, &environment, &credential)
+        .await
+        .unwrap();
+    assert_eq!(account, "123456789012");
+    let key = CredentialRef {
+        organization: "test-org".into(),
+        connection: "test-connection".into(),
+        provider: "aws".into(),
+        reference: "test-ref".into(),
+    };
+    let update = registry.begin_credential_update(key.clone()).unwrap();
+    registry
+        .publish_credential(
+            update,
+            PreparedCredential {
+                version: "1".into(),
+                account,
+                values: std::sync::Arc::new(credential),
+                expires_at: None,
+            },
+        )
+        .unwrap();
+    let admission = registry.admit_credential(&key, &pin).unwrap();
+    let client = registry
+        .prepared_client(admission, "test-sandbox", &environment.values)
+        .await
+        .unwrap();
+    let created = client
+        .call(
+            Operation::SandboxCreate {
+                template: "image:example/agent:1|cee98b1a-b843-40f1-97d2-1bfc96c9c676".into(),
+                ttl_seconds: Some(60),
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(created, Value::Sandbox(sandbox) if sandbox.provider_id == "mvm-test"));
     client.shutdown().await;
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -413,4 +481,90 @@ fn bedrock_only_rpc_discovers_and_rejects_non_bedrock_operations_without_python(
         assert!(!error.retryable);
     }
     assert!(matches!(responses[4].outcome, Outcome::Ok(Value::Done)));
+}
+
+#[test]
+fn broker_startup_discovers_verifies_and_dispatches_without_exposing_credentials() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    fn run(frames: &[serde_json::Value], python: &str) -> Vec<Response> {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_magicmtn-provider-aws"))
+            .env("MAGICMTN_AWS_PYTHON", python)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        for frame in frames {
+            writeln!(input, "{frame}").unwrap();
+        }
+        drop(input);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("test-secret"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("test-secret"));
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+    let python = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-python.py");
+    let startup = |credential, verify_account| json!({"id":1,"protocol_version":2,"provider":"aws","credential":credential,"verify_account":verify_account});
+    let creds = json!({"AWS_ACCESS_KEY_ID":"test-key","AWS_SECRET_ACCESS_KEY":"test-secret"});
+    let discovery = run(
+        &[startup(serde_json::Value::Null, false)],
+        "/missing/python",
+    );
+    let Outcome::Ok(Value::Description(manifest)) = &discovery[0].outcome else {
+        panic!("discovery failed")
+    };
+    assert_eq!(
+        manifest.credential,
+        Some(magicmtn_provider_aws::AwsProvider::credential_spec())
+    );
+    assert_eq!(discovery[0].protocol_version, CREDENTIAL_PROTOCOL_VERSION);
+    let verified = run(&[startup(creds.clone(), true)], python);
+    assert!(
+        matches!(&verified[0].outcome, Outcome::Ok(Value::VerifiedAccount(account)) if account == "123456789012")
+    );
+    let rejected = run(
+        &[startup(
+            json!({"AWS_SECRET_ACCESS_KEY":"test-secret"}),
+            false,
+        )],
+        "/missing/python",
+    );
+    assert!(matches!(&rejected[0].outcome, Outcome::Error(error) if !error.retryable));
+    let rejected = run(
+        &[startup(
+            json!({"AWS_ACCESS_KEY_ID":"test-key","AWS_SECRET_ACCESS_KEY":"test-secret","AWS_SESSION_TOKEN":"unexpected"}),
+            false,
+        )],
+        "/missing/python",
+    );
+    assert!(matches!(&rejected[0].outcome, Outcome::Error(error) if !error.retryable));
+    let shutdown =
+        json!({"id":3,"protocol_version":2,"provider":"aws","operation":{"name":"shutdown"}});
+    let operation = if cfg!(feature = "bedrock-only") {
+        json!({"name":"infer","arguments":{"request":{"model":{"model":"us.openai.gpt-6.1-sol","provider":"aws","parameters":{"max_tokens":100}},"task":"chat","input":{"messages":[{"role":"user","content":"hi"}]}}}})
+    } else {
+        json!({"name":"sandbox_create","arguments":{"template":"image:example/agent:1|cee98b1a-b843-40f1-97d2-1bfc96c9c676", "ttl_seconds":null}})
+    };
+    let responses = run(
+        &[
+            startup(creds, false),
+            json!({"id":2,"protocol_version":2,"provider":"aws","operation":operation}),
+            shutdown,
+        ],
+        python,
+    );
+    assert_eq!(responses.len(), 3);
+    assert!(
+        responses
+            .iter()
+            .all(|resp| resp.protocol_version == CREDENTIAL_PROTOCOL_VERSION
+                && matches!(resp.outcome, Outcome::Ok(_)))
+    );
 }

@@ -22,7 +22,7 @@ Use focused tests while iterating. Run `./package.sh` and the ignored archive co
 - `src/inference.rs`: Bedrock/SageMaker routing, chat/tool normalization, validation.
 - `src/aws_bridge.py`: Boto3 calls, STS role assumption, ownership checks, SageMaker lifecycle, MicroVM endpoint validation, and authenticated agent calls.
 - `src/nitro_eks.py`: embedded EKS Nitro Job lifecycle, cluster-bound STS auth, ownership and UID checks, and bounded Kubernetes exec with credentials in pipes.
-- `src/rpc.rs`: combined persistent protocol v1 dispatcher.
+- `src/rpc.rs`: combined persistent protocol v1 and credential-aware v2 dispatcher.
 - `src/main.rs`: RPC entry point and explicit deployment CLI.
 - `sandbox/agent.py`, `sandbox/Dockerfile`: bounded command execution and image.
 - `tests/rpc.rs`, `tests/fixtures/fake-python.py`: Rust/adapter and SDK host contracts.
@@ -34,7 +34,7 @@ Keep changes focused and dependencies stable. Preserve the library build without
 
 ## Compatibility boundaries
 
-- Preserve provider name `aws`, protocol version, public SDK interfaces, CLI, environment variables, resource IDs, and persisted sandbox metadata.
+- Preserve provider name `aws`, legacy protocol v1 compatibility and credential-aware v2, public SDK interfaces, CLI, environment variables, resource IDs, and persisted sandbox metadata.
 - Keep discovery independent of Python, credentials, and network access. Write RPC or CLI JSON to stdout and diagnostics to stderr.
 - Preserve `bedrock-only` chat capabilities, explicit data-plane role requirement, Ohio endpoint, and rejection of SageMaker inference. The library methods and deployment CLI remain available.
 - Retain the default build's sandbox operations and five deployment operations. Use the combined dispatcher for all provider traits.

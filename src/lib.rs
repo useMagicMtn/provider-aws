@@ -1,13 +1,15 @@
 //! AWS provider using an embedded adapter to the official Boto3 SDK.
 use anyhow::{Context, Result, bail, ensure};
-use magicmtn_sdk::plugin::{Capabilities, ErrorCode, ProviderError};
+use magicmtn_sdk::plugin::{
+    Capabilities, CredentialSpec, CredentialValues, ErrorCode, ProviderError,
+};
 use magicmtn_sdk::{
     BoxFuture, ExecResult, InferenceBackend, InferenceDeployment, InferenceDeploymentBackend,
     InferenceDeploymentRef, InferenceDeploymentSpec, InferenceRequest, InferenceResponse,
     ProviderSandbox, SandboxBackend, ScpDirection,
 };
 use serde_json::{Value, json};
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -39,15 +41,37 @@ pub fn capabilities() -> Capabilities {
 #[derive(Clone, Debug)]
 pub struct AwsProvider {
     python: String,
+    credential: Option<Arc<CredentialValues>>,
 }
 impl AwsProvider {
     pub fn new(python: impl Into<String>) -> Self {
         Self {
             python: python.into(),
+            credential: None,
         }
     }
     pub fn from_env() -> Self {
         Self::new(std::env::var("MAGICMTN_AWS_PYTHON").unwrap_or_else(|_| "python3".into()))
+    }
+    pub fn credential_spec() -> CredentialSpec {
+        CredentialSpec {
+            fields: vec!["AWS_ACCESS_KEY_ID".into(), "AWS_SECRET_ACCESS_KEY".into()],
+        }
+    }
+    pub fn with_credential(mut self, credential: CredentialValues) -> Result<Self> {
+        Self::credential_spec().check_values(&credential)?;
+        self.credential = Some(Arc::new(credential));
+        Ok(self)
+    }
+    pub async fn verify_account(&self) -> Result<String> {
+        ensure!(self.credential.is_some(), "AWS credentials are required");
+        let result = self.call(json!({"operation":"verify_account"})).await?;
+        let account = result.as_str().context("invalid AWS account identity")?;
+        ensure!(
+            account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit()),
+            "invalid AWS account identity"
+        );
+        Ok(account.to_owned())
     }
     async fn call(&self, request: Value) -> Result<Value> {
         let mut child = Command::new(&self.python)
@@ -61,7 +85,12 @@ impl AwsProvider {
         let mut input = child.stdin.take().context("adapter stdin missing")?;
         let output = child.stdout.take().context("adapter stdout missing")?;
         tokio::time::timeout(Duration::from_secs(100), async {
-            input.write_all(&serde_json::to_vec(&request)?).await?;
+            let payload = zeroize::Zeroizing::new(serde_json::to_vec(&(
+                &request,
+                self.credential.as_deref(),
+            ))?);
+            input.write_all(&payload).await?;
+            drop(payload);
             drop(input);
             let mut bytes = Vec::new();
             output.take(768 * 1024 + 1).read_to_end(&mut bytes).await?;

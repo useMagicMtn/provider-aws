@@ -5,12 +5,13 @@ use magicmtn_sdk::plugin::*;
 use magicmtn_sdk::{InferenceBackend, InferenceDeploymentBackend, SandboxBackend};
 use std::io::{BufRead, Read, Write};
 
-pub async fn run(backend: AwsProvider) -> Result<()> {
+pub async fn run(mut backend: AwsProvider) -> Result<()> {
     let capabilities = capabilities();
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
+    let mut protocol = None;
     loop {
-        let mut bytes = Vec::new();
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
         if input
             .by_ref()
             .take(1024 * 1024 + 1)
@@ -22,14 +23,76 @@ pub async fn run(backend: AwsProvider) -> Result<()> {
         if bytes.len() > 1024 * 1024 || !bytes.ends_with(b"\n") {
             bail!("invalid or oversized RPC frame");
         }
-        let request: Request = serde_json::from_slice(&bytes)?;
-        if request.protocol_version != PROTOCOL_VERSION || request.provider != "aws" {
+        // The first frame negotiates the legacy direct RPC or broker startup protocol.
+        if protocol.is_none() {
+            if let Ok(startup) = serde_json::from_slice::<ProviderStartupInput>(&bytes) {
+                drop(bytes);
+                if startup.protocol_version != CREDENTIAL_PROTOCOL_VERSION
+                    || startup.id != 1
+                    || startup.provider != "aws"
+                    || (startup.verify_account && startup.credential.is_none())
+                {
+                    bail!("provider startup protocol or identity mismatch");
+                }
+                let discovery = startup.credential.is_none();
+                let verification = startup.verify_account;
+                let manifest = ProviderManifest {
+                    credential: Some(AwsProvider::credential_spec()),
+                    manifest_version: MANIFEST_VERSION,
+                    provider_version: VERSION.into(),
+                    capabilities: capabilities.clone(),
+                };
+                let result = match startup.credential {
+                    None => Ok(Value::Description(manifest)),
+                    Some(credential) => match backend.clone().with_credential(credential) {
+                        Ok(prepared) => {
+                            backend = prepared;
+                            if verification {
+                                backend.verify_account().await.map(Value::VerifiedAccount)
+                            } else {
+                                Ok(Value::Description(manifest))
+                            }
+                        }
+                        Err(error) => Err(error),
+                    },
+                };
+                let failed = result.is_err();
+                let outcome = match result {
+                    Ok(value) => Outcome::Ok(value),
+                    Err(_) => Outcome::Error(ProviderError {
+                        code: ErrorCode::Internal,
+                        retryable: false,
+                        message: "provider credential initialization failed".into(),
+                    }),
+                };
+                write_response(
+                    &mut output,
+                    Response {
+                        id: startup.id,
+                        protocol_version: CREDENTIAL_PROTOCOL_VERSION,
+                        provider: "aws".into(),
+                        outcome,
+                    },
+                )?;
+                if discovery || verification || failed {
+                    return Ok(());
+                }
+                protocol = Some(CREDENTIAL_PROTOCOL_VERSION);
+                continue;
+            }
+            protocol = Some(PROTOCOL_VERSION);
+        }
+        let request: Request = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("invalid provider RPC frame"))?;
+        if Some(request.protocol_version) != protocol || request.provider != "aws" {
             bail!("provider protocol or identity mismatch");
         }
         let shutdown = matches!(request.operation, Operation::Shutdown);
         let supported = capabilities.supports(&request.operation);
         let result = match request.operation {
             Operation::Describe => Ok(Value::Description(ProviderManifest {
+                credential: (protocol == Some(CREDENTIAL_PROTOCOL_VERSION))
+                    .then(AwsProvider::credential_spec),
                 manifest_version: MANIFEST_VERSION,
                 provider_version: VERSION.into(),
                 capabilities: capabilities.clone(),
@@ -114,19 +177,24 @@ pub async fn run(backend: AwsProvider) -> Result<()> {
         };
         let response = Response {
             id: request.id,
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: request.protocol_version,
             provider: "aws".into(),
             outcome,
         };
-        let bytes = serde_json::to_vec(&response)?;
-        if bytes.len() >= 1024 * 1024 {
-            bail!("provider result exceeds message limit");
-        }
-        output.write_all(&bytes)?;
-        output.write_all(b"\n")?;
-        output.flush()?;
+        write_response(&mut output, response)?;
         if shutdown {
             return Ok(());
         }
     }
+}
+
+fn write_response(output: &mut impl Write, response: Response) -> Result<()> {
+    let bytes = serde_json::to_vec(&response)?;
+    if bytes.len() >= 1024 * 1024 {
+        bail!("provider result exceeds message limit");
+    }
+    output.write_all(&bytes)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
+    Ok(())
 }

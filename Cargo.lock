@@ -265,7 +265,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "magicmtn-provider-aws"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -273,6 +273,7 @@ dependencies = [
  "magicmtn-sdk",
  "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -289,6 +290,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -298,6 +300,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -579,6 +582,12 @@ dependencies = [
  "libc",
  "rustix",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
 
 [[package]]
 name = "zlib-rs"

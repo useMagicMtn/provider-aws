@@ -1,6 +1,6 @@
 [package]
 name = "magicmtn-provider-aws"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
@@ -28,6 +28,9 @@ include = [
     "package.sh",
 ]
 
+[package.metadata.magicmtn]
+protocol-version = 2
+
 [[bin]]
 name = "magicmtn-provider-aws"
 path = "src/main.rs"
@@ -42,6 +45,7 @@ plugin = ["dep:clap", "tokio/macros", "tokio/rt"]
 magicmtn-sdk = "0.1.0"
 anyhow = "1"
 serde_json = "1"
+zeroize = "1.8"
 tokio = { version = "1", features = ["process", "io-util", "time"] }
 
 clap = { version = "4", features = ["derive"], optional = true }

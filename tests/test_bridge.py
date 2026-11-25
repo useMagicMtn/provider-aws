@@ -241,7 +241,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_sensitive_error_body_never_disclosed(self):
         e = ClientError({"Error": {"Code": "AccessDeniedException", "Message": "secret-prompt secret-token"}}, "RunMicrovm")
-        with patch.object(bridge, "dispatch", side_effect=e), patch.object(bridge.sys, "stdin", type("Input", (), {"buffer": io.BytesIO(b'{}')})()), patch.object(bridge.sys, "stdout", new_callable=io.StringIO) as out:
+        with patch.object(bridge, "dispatch", side_effect=e), patch.object(bridge.sys, "stdin", type("Input", (), {"buffer": io.BytesIO(b'[{}, null]')})()), patch.object(bridge.sys, "stdout", new_callable=io.StringIO) as out:
             bridge.main()
             self.assertNotIn("secret", out.getvalue())
             self.assertIn("AccessDeniedException", out.getvalue())
@@ -287,6 +287,24 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(result["state"], "stopped")
             self.assertEqual(result["ready_replicas"], 0)
             stub.assert_no_pending_responses()
+
+    def test_broker_credentials_override_host_chain_and_verify_stable_account(self):
+        broker = {"AWS_ACCESS_KEY_ID": "broker-key", "AWS_SECRET_ACCESS_KEY": "broker-secret"}
+        with patch.object(bridge, "CREDENTIAL", broker), patch.dict(os.environ, {
+                "AWS_ACCESS_KEY_ID": "ambient-key", "AWS_SECRET_ACCESS_KEY": "ambient-secret",
+                "AWS_SESSION_TOKEN": "ambient-token", "AWS_DEFAULT_REGION": "us-east-1"}):
+            sts = bridge.client("sts")
+            credentials = sts._request_signer._credentials
+            self.assertEqual(credentials.access_key, "broker-key")
+            self.assertEqual(credentials.secret_key, "broker-secret")
+            self.assertIsNone(credentials.token)
+            with Stubber(sts) as stub, patch.object(bridge, "client", return_value=sts):
+                stub.add_response("get_caller_identity", {"Account": "123456789012",
+                    "Arn": "arn:aws:iam::123456789012:user/test", "UserId": "test-user"}, {})
+                self.assertEqual(bridge.dispatch({"operation": "verify_account"}), "123456789012")
+                stub.assert_no_pending_responses()
+        with patch.object(bridge, "CREDENTIAL", None), self.assertRaises(bridge.ProviderFailure):
+            bridge.dispatch({"operation": "verify_account"})
 
     def test_sdk_retry_disabled(self):
         with patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "AWS_DEFAULT_REGION": "us-east-1", "AWS_ENDPOINT_URL": "http://127.0.0.1:12345"}):

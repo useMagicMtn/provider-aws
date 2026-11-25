@@ -10,6 +10,7 @@ import urllib.request
 from urllib.parse import urlsplit
 
 LIMIT = 768 * 1024
+CREDENTIAL = None
 
 
 class ProviderFailure(Exception):
@@ -41,13 +42,24 @@ def microvm_id(request):
     return value
 
 
-def client(service):
+def credential_kwargs():
+    if CREDENTIAL is None:
+        return {}
+    return {"aws_access_key_id": CREDENTIAL["AWS_ACCESS_KEY_ID"],
+            "aws_secret_access_key": CREDENTIAL["AWS_SECRET_ACCESS_KEY"]}
+
+
+def client(service, connect_timeout=5, read_timeout=70):
     import boto3
     from botocore.config import Config
-    # Resolve credentials through Boto3's standard environment/profile/role chain.
+    # Explicit broker credentials take precedence over the legacy host credential chain.
     # Disable retry even on mutations and model invocations.
-    return boto3.client(service, config=Config(connect_timeout=5, read_timeout=70,
-                       retries={"total_max_attempts": 1}, ignore_configured_endpoint_urls=True))
+    region = os.environ.get("AWS_DEFAULT_REGION")
+    if CREDENTIAL is not None:
+        region = region or os.environ.get("AWS_REGION")
+    config = Config(connect_timeout=connect_timeout, read_timeout=read_timeout,
+                    retries={"total_max_attempts": 1}, ignore_configured_endpoint_urls=True)
+    return boto3.client(service, region_name=region, config=config, **credential_kwargs())
 
 
 def bedrock_client():
@@ -58,7 +70,7 @@ def bedrock_client():
     config = Config(signature_version="v4", connect_timeout=5, read_timeout=70,
                     retries={"total_max_attempts": 1}, ignore_configured_endpoint_urls=True)
     role = os.environ.get("MAGICMTN_AWS_BEDROCK_ROLE_ARN")
-    session = boto3.Session(region_name=region)
+    session = boto3.Session(region_name=region, **credential_kwargs())
     if role:
         require(re.fullmatch(r"arn:aws:iam::[0-9]{12}:role/[\w+=,.@/-]+", role), "invalid Bedrock role ARN")
         credentials = session.client("sts", config=config).assume_role(
@@ -255,6 +267,13 @@ def endpoint_url(endpoint, identifier, region):
 
 def dispatch(request):
     op = request["operation"]
+    if op == "verify_account":
+        require(CREDENTIAL is not None, "AWS credentials are required")
+        # STS account identity is stable across access-key rotations.
+        identity = client("sts", connect_timeout=3, read_timeout=5).get_caller_identity()
+        account = identity.get("Account", "")
+        require(isinstance(account, str) and re.fullmatch(r"[0-9]{12}", account), "invalid AWS account identity")
+        return account
     if op == "sandbox_create":
         template = request.get("template", "")
         backend = os.environ.get("MAGICMTN_AWS_SANDBOX_BACKEND", "microvm")
@@ -361,8 +380,14 @@ def dispatch(request):
 
 
 def main():
+    global CREDENTIAL
     try:
-        request = json.loads(sys.stdin.buffer.read(1024 * 1024 + 1))
+        payload = json.loads(sys.stdin.buffer.read(1024 * 1024 + 1))
+        request, CREDENTIAL = payload
+        require(CREDENTIAL is None or (isinstance(CREDENTIAL, dict)
+                and set(CREDENTIAL) == {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}
+                and all(isinstance(value, str) and value for value in CREDENTIAL.values())),
+                "invalid AWS credential bundle")
         result = dispatch(request)
     except ProviderFailure as error:
         result = {"error": {"code": error.code, "message": error.message}}

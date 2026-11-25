@@ -1,12 +1,59 @@
 """Nitro Sandbox Jobs on EKS. Prepended to aws_bridge.py in the executable."""
 import base64
 import selectors
+import signal
 import ssl
 import subprocess
+from contextlib import closing, contextmanager
 from urllib.parse import urlencode
 
 NITRO_OWNER = {"magicmtn.ai/provider": "aws-nitro-v1"}
 NITRO_AGENT = "/opt/magicmtn-agent.py"
+NITRO_STARTUP_SECONDS = 45
+NITRO_NOT_READY = "Nitro sandbox is not ready"
+
+
+class NitroWaitExpired(Exception):
+    pass
+
+
+class NitroWatchForbidden(Exception):
+    pass
+
+
+@contextmanager
+def nitro_deadline(deadline):
+    """Bound wall time across discovery, headers and partial stream reads.
+
+    The embedded adapter runs one operation on its main thread (POSIX).
+    Nested watch windows restore the enclosing absolute startup deadline.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise NitroWaitExpired()
+    previous = signal.getsignal(signal.SIGALRM)
+    started = time.monotonic()
+
+    def expire(signum, frame):
+        raise NitroWaitExpired()
+
+    signal.signal(signal.SIGALRM, expire)
+    old_timer = signal.setitimer(signal.ITIMER_REAL, remaining)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        if old_timer[0]:
+            signal.setitimer(signal.ITIMER_REAL,
+                             max(0.000001, old_timer[0] - (time.monotonic() - started)))
+
+
+def nitro_remaining(deadline, maximum):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise NitroWaitExpired()
+    return min(maximum, remaining)
 
 
 def nitro_matches(expected, actual):
@@ -35,9 +82,10 @@ def nitro_session(value):
     return str(result)
 
 
-def nitro_token(cluster):
+def nitro_token(cluster, deadline=None):
     # EKS authenticates a presigned STS identity request bound to this cluster.
-    sts = client("sts")
+    sts = client("sts") if deadline is None else client(
+        "sts", connect_timeout=nitro_remaining(deadline, 5), read_timeout=nitro_remaining(deadline, 5))
 
     def add_cluster_header(request, **kwargs):
         request.headers["x-k8s-aws-id"] = cluster
@@ -48,12 +96,13 @@ def nitro_token(cluster):
 
 
 class NitroEks:
-    def __init__(self):
+    def __init__(self, deadline=None):
         cluster = os.environ.get("MAGICMTN_AWS_NITRO_EKS_CLUSTER", "")
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", cluster),
                 "set MAGICMTN_AWS_NITRO_EKS_CLUSTER to the EKS cluster name")
         self.namespace = nitro_namespace(os.environ.get("MAGICMTN_AWS_NITRO_EKS_NAMESPACE", "magicmtn-sandboxes"))
-        api = client("eks")
+        api = client("eks") if deadline is None else client(
+            "eks", connect_timeout=nitro_remaining(deadline, 5), read_timeout=nitro_remaining(deadline, 10))
         self.region = api.meta.region_name
         info = api.describe_cluster(name=cluster)["cluster"]
         arn = info.get("arn", "").split(":", 5)
@@ -75,28 +124,37 @@ class NitroEks:
         self.endpoint = self.endpoint.rstrip("/")
         self.ca = info["certificateAuthority"]["data"]
         context = ssl.create_default_context(cadata=base64.b64decode(self.ca, validate=True).decode())
-        self.token = nitro_token(cluster)
+        self.token = nitro_token(cluster) if deadline is None else nitro_token(cluster, deadline)
         self.opener = urllib.request.build_opener(
             NoRedirect(), urllib.request.HTTPSHandler(context=context))
         self.jobs = f"/apis/batch/v1/namespaces/{self.namespace}/jobs"
         self.pods = f"/api/v1/namespaces/{self.namespace}/pods"
 
-    def request(self, method, path, body=None, allow_missing=False):
+    def request(self, method, path, body=None, allow_missing=False, deadline=None):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(self.endpoint + path, data=data, method=method,
                                      headers={"Authorization": "Bearer " + self.token,
                                               "Content-Type": "application/json"})
         try:
-            with self.opener.open(req, timeout=10) as response:
+            with self.opener.open(req, timeout=10 if deadline is None else nitro_remaining(deadline, 10)) as response:
                 raw = response.read(LIMIT + 1)
         except urllib.error.HTTPError as error:
             error.close()
             if allow_missing and error.code == 404:
                 return None
+            if deadline is not None:
+                message = ("Nitro EKS readiness read was not authorized" if error.code in (401, 403)
+                           else "Nitro EKS readiness read failed")
+                raise ProviderFailure(message, "upstream_unavailable") from None
             raise ProviderFailure("Nitro EKS API request failed; reconcile resource state before retrying",
                                   "upstream_unavailable") from None
         require(len(raw) <= LIMIT, "Nitro EKS response too large")
-        return json.loads(raw)
+        try:
+            result = json.loads(raw)
+            require(isinstance(result, dict), "invalid Nitro EKS response")
+            return result
+        except (ValueError, UnicodeError):
+            raise ProviderFailure("invalid Nitro EKS response", "upstream_unavailable") from None
 
     def owned_job(self, job, expected_uid=None):
         metadata = job.get("metadata", {})
@@ -150,34 +208,158 @@ class NitroEks:
                 "create_time_ms": None, "metadata": {"backend": "nitro-eks", "region": self.region,
                 "image": image, "session": session, "runtime_class": "isolated-sandbox"}}
 
-    def execute(self, job_name, uid, request):
-        deadline = time.monotonic() + 15
-        while True:
-            job = self.request("GET", self.jobs + "/" + job_name)
-            self.owned_job(job, uid)
-            require(not job["metadata"].get("deletionTimestamp"), "Nitro sandbox is terminating")
-            require(not any(c.get("status") == "True" and c.get("type") in ("Complete", "Failed")
-                            for c in job.get("status", {}).get("conditions", [])), "Nitro sandbox has finished")
-            query = urlencode({"labelSelector": "batch.kubernetes.io/controller-uid=" + uid, "limit": 10})
-            pods = self.request("GET", self.pods + "?" + query).get("items", [])
-            for pod in pods:
-                metadata = pod.get("metadata", {})
-                owner = any(o.get("uid") == uid and o.get("kind") == "Job" and o.get("controller") is True
-                            for o in metadata.get("ownerReferences", []))
-                require(owner and metadata.get("namespace") == self.namespace
-                        and metadata.get("labels", {}).get("magicmtn.ai/provider") == NITRO_OWNER["magicmtn.ai/provider"]
-                        and pod.get("spec", {}).get("runtimeClassName") == "isolated-sandbox",
-                        "unexpected Nitro sandbox pod ownership or runtime")
-                if pod.get("status", {}).get("phase") == "Running" and not metadata.get("deletionTimestamp"):
-                    ready = any(c.get("name") == "sandbox" and c.get("ready") is True
-                                for c in pod.get("status", {}).get("containerStatuses", []))
-                    if ready:
-                        pod_name = metadata["name"]
-                        require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,252}", pod_name), "invalid Nitro pod name")
-                        return nitro_exec(self, pod_name, request)
+    def active_job(self, job_name, uid, deadline):
+        job = self.request("GET", self.jobs + "/" + job_name, allow_missing=True, deadline=deadline)
+        require(job is not None, "Nitro sandbox was removed")
+        self.owned_job(job, uid)
+        require(not job["metadata"].get("deletionTimestamp"), "Nitro sandbox is terminating")
+        for condition in job.get("status", {}).get("conditions", []):
+            if condition.get("status") == "True" and condition.get("type") in (
+                    "FailureTarget", "Failed", "SuccessCriteriaMet", "Complete"):
+                if condition.get("reason") == "DeadlineExceeded":
+                    raise ProviderFailure("Nitro sandbox lifetime expired")
+                raise ProviderFailure("Nitro sandbox has finished")
+
+    def pod_observation(self, pod, uid):
+        metadata = pod.get("metadata", {})
+        owner = any(o.get("uid") == uid and o.get("kind") == "Job" and o.get("controller") is True
+                    for o in metadata.get("ownerReferences", []))
+        require(owner and metadata.get("namespace") == self.namespace
+                and metadata.get("labels", {}).get("magicmtn.ai/provider") == NITRO_OWNER["magicmtn.ai/provider"]
+                and pod.get("spec", {}).get("runtimeClassName") == "isolated-sandbox",
+                "unexpected Nitro sandbox pod ownership or runtime")
+        pod_name = metadata.get("name", "")
+        require(isinstance(pod_name, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,252}", pod_name),
+                "invalid Nitro pod name")
+        pod_uid = nitro_session(metadata.get("uid"))
+        if metadata.get("deletionTimestamp"):
+            return None, None
+        status = pod.get("status", {})
+        for container in status.get("containerStatuses", []):
+            if container.get("name") != "sandbox":
+                continue
+            if status.get("phase") == "Running" and container.get("ready") is True:
+                return (pod_name, pod_uid), None
+            if container.get("state", {}).get("waiting", {}).get("reason") in ("ErrImagePull", "ImagePullBackOff"):
+                return None, "Nitro sandbox image could not be pulled"
+        for condition in status.get("conditions", []):
+            if (condition.get("type"), condition.get("status"), condition.get("reason")) == (
+                    "PodScheduled", "False", "Unschedulable"):
+                return None, "Nitro sandbox is waiting for node capacity or scheduling constraints"
+        return None, None
+
+    def revalidate(self, candidate, job_name, uid, deadline):
+        self.active_job(job_name, uid, deadline)
+        pod = self.request("GET", self.pods + "/" + candidate[0], allow_missing=True, deadline=deadline)
+        if pod is None:
+            return False, None
+        actual, reason = self.pod_observation(pod, uid)
+        return actual == candidate, reason
+
+    def watch_pods(self, selector, version, deadline):
+        window = min(deadline, time.monotonic() + 5)
+        seconds = max(1, int(window - time.monotonic()))
+        query = urlencode({"labelSelector": selector, "watch": "true", "resourceVersion": version,
+                           "timeoutSeconds": seconds})
+        request = urllib.request.Request(self.endpoint + self.pods + "?" + query,
+                                         headers={"Authorization": "Bearer " + self.token,
+                                                  "Accept": "application/json"})
+        try:
+            with nitro_deadline(window):
+                with self.opener.open(request, timeout=nitro_remaining(window, 5)) as response:
+                    while True:
+                        line = response.readline(LIMIT + 1)
+                        if not line:
+                            return
+                        require(len(line) <= LIMIT, "Nitro EKS watch event too large")
+                        try:
+                            event = json.loads(line)
+                        except (ValueError, UnicodeError):
+                            raise ProviderFailure("invalid Nitro EKS watch event", "upstream_unavailable") from None
+                        require(isinstance(event, dict) and isinstance(event.get("object"), dict),
+                                "invalid Nitro EKS watch event")
+                        kind, obj = event.get("type"), event["object"]
+                        if kind == "ERROR" and obj.get("code") == 410:
+                            return
+                        if kind not in ("ADDED", "MODIFIED", "DELETED", "BOOKMARK"):
+                            raise ProviderFailure("Nitro EKS readiness watch failed", "upstream_unavailable")
+                        if kind in ("ADDED", "MODIFIED"):
+                            yield obj
+        except urllib.error.HTTPError as error:
+            error.close()
+            if error.code == 410:
+                return
+            if error.code == 403:
+                raise NitroWatchForbidden() from None
+            raise ProviderFailure("Nitro EKS readiness watch failed", "upstream_unavailable") from None
+        except (NitroWaitExpired, TimeoutError):
             if time.monotonic() >= deadline:
-                raise ProviderFailure("Nitro sandbox is not ready", "upstream_unavailable")
-            time.sleep(0.2)
+                raise NitroWaitExpired() from None
+            # Recheck the Job and relist after each short watch window.
+            return
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, TimeoutError):
+                return
+            raise ProviderFailure("Nitro EKS readiness watch failed", "upstream_unavailable") from None
+
+    def wait_ready(self, job_name, uid, deadline):
+        blocker = NITRO_NOT_READY
+        polling = False
+        backoff = 0.2
+        selector = "batch.kubernetes.io/controller-uid=" + uid
+        query = urlencode({"labelSelector": selector})
+        def confirmed(candidate):
+            nonlocal blocker
+            if candidate is None:
+                return False
+            ready, reason = self.revalidate(candidate, job_name, uid, deadline)
+            if reason:
+                blocker = reason
+            nitro_remaining(deadline, NITRO_STARTUP_SECONDS)
+            return ready
+
+        try:
+            with nitro_deadline(deadline):
+                while True:
+                    self.active_job(job_name, uid, deadline)
+                    snapshot = self.request("GET", self.pods + "?" + query, deadline=deadline)
+                    require(not snapshot.get("metadata", {}).get("continue"), "incomplete Nitro EKS pod list")
+                    for pod in snapshot.get("items", []):
+                        candidate, reason = self.pod_observation(pod, uid)
+                        if reason:
+                            blocker = reason
+                        if confirmed(candidate):
+                            return candidate[0]
+                    if not polling:
+                        version = snapshot.get("metadata", {}).get("resourceVersion")
+                        require(isinstance(version, str) and version, "missing Nitro EKS pod resource version")
+                        try:
+                            candidate = None
+                            with closing(self.watch_pods(selector, version, deadline)) as events:
+                                for pod in events:
+                                    candidate, reason = self.pod_observation(pod, uid)
+                                    if reason:
+                                        blocker = reason
+                                    if candidate:
+                                        break
+                            if confirmed(candidate):
+                                return candidate[0]
+                        except NitroWatchForbidden:
+                            polling = True
+                    time.sleep(nitro_remaining(deadline, backoff))
+                    backoff = min(1, backoff * 2)
+        except NitroWaitExpired:
+            raise ProviderFailure(blocker, "upstream_unavailable") from None
+        except (TimeoutError, urllib.error.URLError):
+            message = blocker if time.monotonic() >= deadline else "Nitro EKS readiness read failed"
+            raise ProviderFailure(message, "upstream_unavailable") from None
+
+    def execute(self, job_name, uid, request, deadline=None):
+        if deadline is None:
+            deadline = time.monotonic() + NITRO_STARTUP_SECONDS
+        pod_name = self.wait_ready(job_name, uid, deadline)
+        # Once readiness is established, submit exactly one command with its own budget.
+        return nitro_exec(self, pod_name, request)
 
 
 def nitro_exec(api, pod, request):
@@ -260,6 +442,20 @@ def nitro_dispatch(request):
         ttl = request.get("ttl_seconds", 28800)
         require(type(ttl) is int and ttl > 0, "invalid Nitro sandbox TTL")
         return NitroEks().create(image, session, min(ttl, 28800))
+    if op == "exec":
+        deadline = time.monotonic() + NITRO_STARTUP_SECONDS
+        try:
+            with nitro_deadline(deadline):
+                api = NitroEks(deadline)
+                job_name, uid = api.reference(request["sandbox"])
+        except NitroWaitExpired:
+            raise ProviderFailure(NITRO_NOT_READY, "upstream_unavailable") from None
+        except Exception:
+            # Botocore may wrap an exception raised by the wall-clock timer.
+            if time.monotonic() >= deadline:
+                raise ProviderFailure(NITRO_NOT_READY, "upstream_unavailable") from None
+            raise
+        return api.execute(job_name, uid, request, deadline)
     api = NitroEks()
     job_name, uid = api.reference(request["sandbox"])
     if op == "terminate":
@@ -270,6 +466,4 @@ def nitro_dispatch(request):
                         {"apiVersion": "v1", "kind": "DeleteOptions", "propagationPolicy": "Foreground",
                          "preconditions": {"uid": uid}}, allow_missing=True)
         return None
-    if op == "exec":
-        return api.execute(job_name, uid, request)
     raise ProviderFailure("unsupported Nitro operation", "unsupported_operation")

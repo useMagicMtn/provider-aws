@@ -2,9 +2,14 @@
 # Subprocess fixture: validates Rust's bridge payload, never accesses AWS.
 import json
 import sys
-request = json.load(sys.stdin)
+request, credential = json.load(sys.stdin)
 op = request['operation']
-if op == 'sandbox_create':
+if credential is not None:
+    assert credential == {'AWS_ACCESS_KEY_ID': 'test-key', 'AWS_SECRET_ACCESS_KEY': 'test-secret'}
+if op == 'verify_account':
+    assert credential == {'AWS_ACCESS_KEY_ID': 'test-key', 'AWS_SECRET_ACCESS_KEY': 'test-secret'}
+    value = '123456789012'
+elif op == 'sandbox_create':
     value = {'provider_id':'mvm-test','status':'PENDING','create_time_ms':None,'metadata':{'region':'us-east-1'}}
 elif op == 'exec':
     assert request['command'] == 'echo' and request['args'] == ['literal;雪']

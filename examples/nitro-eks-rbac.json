@@ -39,7 +39,8 @@
           ],
           "verbs": [
             "get",
-            "list"
+            "list",
+            "watch"
           ]
         },
         {

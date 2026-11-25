@@ -21,16 +21,16 @@ export MAGICMTN_AWS_PYTHON="$PWD/.venv/bin/python"
 cargo build --locked
 ```
 
-For a different checkout layout, update the SDK paths in `.cargo/config.toml`. Use `target/debug/magicmtn-provider-aws` as the executable in a MagicMtn SDK host. The executable accepts newline-delimited MagicMtn provider protocol v1 messages on stdin. To verify discovery, run the following command.
+For a different checkout layout, update the SDK paths in `.cargo/config.toml`. Use `target/debug/magicmtn-provider-aws` as the executable in a MagicMtn SDK host. Registry packages use the MagicMtn credential startup protocol v2. The executable also accepts legacy direct protocol v1 requests. To verify credential-independent discovery, run the following command.
 
 ```sh
-printf '%s\n' '{"id":0,"protocol_version":1,"provider":"aws","operation":{"name":"describe"}}' \
+printf '%s\n' '{"id":1,"protocol_version":2,"provider":"aws","credential":null,"verify_account":false}' \
   | ./target/debug/magicmtn-provider-aws
 ```
 
 ## Connect to AWS
 
-Set AWS credentials on the host that runs the provider. You can select a configured profile with `AWS_PROFILE` or use the host's IAM workload role. Keep `MAGICMTN_AWS_PYTHON` set to the interpreter from the build steps. See [host configuration](USAGE.md#host-configuration) for region, role, and sandbox settings.
+For a Registry-installed provider, configure an AWS access key through the MagicMtn credential broker using `magic --local provider configure aws --secret-file <path>` (see [credential setup](USAGE.md#provider-credentials)). Direct library use, the deployment CLI, and legacy protocol v1 continue to use Boto3’s host credential chain, including `AWS_PROFILE` and IAM workload roles. Set `MAGICMTN_AWS_PYTHON` to the interpreter from the build steps for direct use. See [host configuration](USAGE.md#host-configuration) for region, role, and sandbox settings.
 
 | Service                    | How to use it                                                                                                                                                                                                 |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
