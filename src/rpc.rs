@@ -2,7 +2,9 @@
 use anyhow::{Result, bail};
 use magicmtn_provider_aws::{AwsProvider, VERSION, capabilities};
 use magicmtn_sdk::plugin::*;
-use magicmtn_sdk::{InferenceBackend, InferenceDeploymentBackend, SandboxBackend};
+use magicmtn_sdk::{
+    InferenceBackend, InferenceDeploymentBackend, SandboxBackend, provider_setup::ProviderSetup,
+};
 use std::io::{BufRead, Read, Write};
 
 pub async fn run(mut backend: AwsProvider) -> Result<()> {
@@ -88,17 +90,36 @@ pub async fn run(mut backend: AwsProvider) -> Result<()> {
             bail!("provider protocol or identity mismatch");
         }
         let shutdown = matches!(request.operation, Operation::Shutdown);
-        let supported = capabilities.supports(&request.operation);
+        let supported = capabilities.supports(&request.operation)
+            && (!matches!(request.operation, Operation::ProviderConfigure { .. })
+                || protocol == Some(CREDENTIAL_PROTOCOL_VERSION));
         let result = match request.operation {
             Operation::Describe => Ok(Value::Description(ProviderManifest {
                 credential: (protocol == Some(CREDENTIAL_PROTOCOL_VERSION))
                     .then(AwsProvider::credential_spec),
                 manifest_version: MANIFEST_VERSION,
                 provider_version: VERSION.into(),
-                capabilities: capabilities.clone(),
+                capabilities: {
+                    let mut capabilities = capabilities.clone();
+                    if protocol == Some(PROTOCOL_VERSION) {
+                        capabilities.setup = None;
+                    }
+                    capabilities
+                },
             })),
             Operation::Shutdown => Ok(Value::Done),
             _ if !supported => Err(anyhow::anyhow!("unsupported operation")),
+            Operation::ProviderConfigure { options } => backend
+                .configure(&options)
+                .await
+                .map(Value::ConfiguredConnection),
+            Operation::SandboxPrepareImage { images } => backend
+                .prepare_image(&images)
+                .await
+                .map(Value::PreparedImage),
+            Operation::SandboxStatus { sandbox } => SandboxBackend::status(&backend, &sandbox)
+                .await
+                .map(Value::SandboxStatus),
             Operation::SandboxCreate {
                 template,
                 ttl_seconds,

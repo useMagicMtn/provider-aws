@@ -54,7 +54,7 @@ def client(service, connect_timeout=5, read_timeout=70):
     from botocore.config import Config
     # Explicit broker credentials take precedence over the legacy host credential chain.
     # Disable retry even on mutations and model invocations.
-    region = os.environ.get("AWS_DEFAULT_REGION")
+    region = os.environ.get("MAGICMTN_AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
     if CREDENTIAL is not None:
         region = region or os.environ.get("AWS_REGION")
     config = Config(connect_timeout=connect_timeout, read_timeout=read_timeout,
@@ -62,11 +62,10 @@ def client(service, connect_timeout=5, read_timeout=70):
     return boto3.client(service, region_name=region, config=config, **credential_kwargs())
 
 
-def bedrock_client():
+def bedrock_client(service="bedrock-runtime"):
     import boto3
     from botocore.config import Config
-    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-2"
-    require(region == "us-east-2", "Bedrock inference must enter through us-east-2")
+    region = bedrock_region()
     config = Config(signature_version="v4", connect_timeout=5, read_timeout=70,
                     retries={"total_max_attempts": 1}, ignore_configured_endpoint_urls=True)
     role = os.environ.get("MAGICMTN_AWS_BEDROCK_ROLE_ARN")
@@ -79,8 +78,9 @@ def bedrock_client():
                                 aws_secret_access_key=credentials["SecretAccessKey"],
                                 aws_session_token=credentials["SessionToken"])
     # Never use a configured endpoint or a bearer API key in place of the role.
-    return session.client("bedrock-runtime", config=config,
-                          endpoint_url="https://bedrock-runtime.us-east-2.amazonaws.com")
+    require(service in ("bedrock-runtime", "bedrock"), "invalid Bedrock service")
+    return session.client(service, config=config,
+                          endpoint_url=f"https://{service}.us-east-2.amazonaws.com")
 
 
 def bedrock_infer(request):
@@ -268,12 +268,11 @@ def endpoint_url(endpoint, identifier, region):
 def dispatch(request):
     op = request["operation"]
     if op == "verify_account":
-        require(CREDENTIAL is not None, "AWS credentials are required")
-        # STS account identity is stable across access-key rotations.
-        identity = client("sts", connect_timeout=3, read_timeout=5).get_caller_identity()
-        account = identity.get("Account", "")
-        require(isinstance(account, str) and re.fullmatch(r"[0-9]{12}", account), "invalid AWS account identity")
-        return account
+        return verify_connection()
+    if op == "configure":
+        return configure_connection(request)
+    if op == "prepare_image":
+        return prepare_aws_image(request.get("images"))
     if op == "sandbox_create":
         template = request.get("template", "")
         backend = os.environ.get("MAGICMTN_AWS_SANDBOX_BACKEND", "microvm")
@@ -281,11 +280,15 @@ def dispatch(request):
         if isinstance(template, str) and (template.startswith("nitro-eks:") or
                 (template.startswith("image:") and backend == "nitro-eks")):
             return nitro_dispatch(request)
-    elif op in ("terminate", "exec", "suspend", "resume"):
+    elif op in ("terminate", "exec", "suspend", "resume", "sandbox_status"):
         identifier = request.get("sandbox", {}).get("provider_id", "")
         if isinstance(identifier, str) and identifier.startswith("nitro-eks/"):
             return nitro_dispatch(request)
     if op.startswith("deployment_"):
+        selected = request.get("spec", {}).get("model", "") if op == "deployment_create" else request.get("resource", {}).get("provider_id", "")
+        prefix = "us.openai." if op == "deployment_create" else "bedrock/"
+        if isinstance(selected, str) and selected.startswith(prefix):
+            return bedrock_selection(request)
         return manage(request)
     if op == "infer":
         if request["target"].startswith("us.openai."):
@@ -343,6 +346,23 @@ def dispatch(request):
     api = client("lambda-microvms")
     region = (request["sandbox"].get("metadata") or {}).get("region")
     require(region is None or region == api.meta.region_name, "sandbox belongs to a different AWS region")
+    if op == "sandbox_status":
+        from botocore.exceptions import ClientError
+        try:
+            current = api.get_microvm(microvmIdentifier=identifier)
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                return "missing"
+            raise
+        require(current.get("microvmId") == identifier, "MicroVM identity changed")
+        state = current.get("state")
+        if state == "TERMINATED":
+            return "missing"
+        if state == "SUSPENDED":
+            return "stopped"
+        if state == "RUNNING":
+            return "running"
+        raise ProviderFailure("MicroVM is not ready", "upstream_unavailable")
     if op in ("terminate", "suspend", "resume"):
         getattr(api, op + "_microvm")(microvmIdentifier=identifier)
         return None

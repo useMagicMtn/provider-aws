@@ -143,7 +143,7 @@ async fn sdk_host_accepts_combined_manifest_without_python_or_credentials() {
     .await
     .unwrap();
     assert_eq!(client.manifest.capabilities.inference_tasks, vec!["chat"]);
-    assert_eq!(client.manifest.capabilities.sandbox_operations.len(), 4);
+    assert_eq!(client.manifest.capabilities.sandbox_operations.len(), 6);
     assert_eq!(
         client
             .manifest
@@ -291,7 +291,7 @@ with tarfile.open(archive) as package:
         installed.manifest.credential,
         Some(magicmtn_provider_aws::AwsProvider::credential_spec())
     );
-    assert_eq!(installed.manifest.capabilities.sandbox_operations.len(), 4);
+    assert_eq!(installed.manifest.capabilities.sandbox_operations.len(), 6);
     assert_eq!(
         installed
             .manifest
@@ -320,6 +320,17 @@ with tarfile.open(archive) as package:
         )]),
     };
     let pin = installed.pin();
+    let configured = registry
+        .configure_credential(
+            &pin,
+            &environment,
+            &credential,
+            &std::collections::BTreeMap::from([("region".into(), "us-east-2".into())]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(configured.account, "123456789012");
+    assert_eq!(configured.configuration["MAGICMTN_AWS_REGION"], "us-east-2");
     let account = registry
         .verify_credential(&pin, &environment, &credential)
         .await

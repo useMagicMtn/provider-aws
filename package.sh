@@ -28,7 +28,7 @@ with tarfile.open(output,'w:gz',format=tarfile.USTAR_FORMAT) as archive:
 print(output)
 assets=Path('dist')/f"{name}-{crate['version']}-assets.tar.gz"
 asset_paths = [
-    'requirements.txt', 'README.md', 'USAGE.md', 'CONTRIBUTING.md', 'AGENTS.md',
+    'requirements.txt', 'SDK_REVISION', 'README.md', 'USAGE.md', 'CONTRIBUTING.md', 'AGENTS.md',
     '.github/assets/logo-light.svg', '.github/assets/logo-dark.svg',
     'sandbox', 'examples', 'LICENSE',
 ]

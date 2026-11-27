@@ -6,7 +6,7 @@ use magicmtn_sdk::plugin::{
 use magicmtn_sdk::{
     BoxFuture, ExecResult, InferenceBackend, InferenceDeployment, InferenceDeploymentBackend,
     InferenceDeploymentRef, InferenceDeploymentSpec, InferenceRequest, InferenceResponse,
-    ProviderSandbox, SandboxBackend, ScpDirection,
+    ProviderSandbox, SandboxBackend, SandboxState, ScpDirection,
 };
 use serde_json::{Value, json};
 use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
@@ -16,26 +16,39 @@ use tokio::{
 };
 
 mod inference;
+mod setup;
+pub use setup::setup_spec;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ADAPTER: &str = concat!(
     include_str!("nitro_eks.py"),
+    "\n",
+    include_str!("setup.py"),
     "\n",
     include_str!("aws_bridge.py")
 );
 
 pub fn capabilities() -> Capabilities {
-    if cfg!(feature = "bedrock-only") {
-        return Capabilities::inference(vec!["chat".into()]);
-    }
     use magicmtn_sdk::plugin::{InferenceDeploymentOperation as D, SandboxOperation as S};
-    let mut result = Capabilities::inference(vec!["chat".into()]).with_inference_deployments(vec![
-        D::Create,
-        D::Start,
-        D::Status,
-        D::Stop,
-        D::Delete,
-    ]);
-    result.sandbox_operations = vec![S::Create, S::Terminate, S::Exec, S::ExecBounded];
+    let mut result = Capabilities::inference(vec!["chat".into()]);
+    result.setup = Some(setup_spec());
+    result.inference_models = vec![magicmtn_sdk::plugin::InferenceModel {
+        id: "us.openai.gpt-6.1-sol".into(),
+        name: "GPT-6.1 Sol".into(),
+        context_window: 1_000_000,
+        max_tokens: 131_072,
+    }];
+    if !cfg!(feature = "bedrock-only") {
+        result.inference_deployment_operations =
+            vec![D::Create, D::Start, D::Status, D::Stop, D::Delete];
+        result.sandbox_operations = vec![
+            S::PrepareImage,
+            S::Create,
+            S::Status,
+            S::Terminate,
+            S::Exec,
+            S::ExecBounded,
+        ];
+    }
     result
 }
 #[derive(Clone, Debug)]
@@ -144,6 +157,26 @@ impl AwsProvider {
     }
 }
 impl SandboxBackend for AwsProvider {
+    fn prepare_image<'a>(
+        &'a self,
+        images: &'a std::collections::BTreeMap<String, magicmtn_sdk::image_registry::Image>,
+    ) -> BoxFuture<'a, magicmtn_sdk::image_registry::PreparedImage> {
+        Box::pin(async move {
+            Ok(serde_json::from_value(
+                self.call(json!({"operation":"prepare_image", "images":images}))
+                    .await?,
+            )?)
+        })
+    }
+    fn status<'a>(&'a self, sandbox: &'a ProviderSandbox) -> BoxFuture<'a, SandboxState> {
+        Box::pin(async move {
+            Ok(serde_json::from_value(
+                self.call(json!({"operation":"sandbox_status", "sandbox":sandbox}))
+                    .await?,
+            )?)
+        })
+    }
+
     fn create<'a>(&'a self, template: &'a str) -> BoxFuture<'a, ProviderSandbox> {
         Box::pin(async move {
             Ok(serde_json::from_value(
@@ -293,6 +326,24 @@ fn upstream(message: &str) -> anyhow::Error {
 
 impl AwsProvider {
     pub fn deployment_ref(&self, id: &str) -> Result<InferenceDeploymentRef> {
+        if id.starts_with("bedrock/") {
+            let parts: Vec<_> = id.split('/').collect();
+            ensure!(
+                parts.len() == 5
+                    && parts[1].len() == 12
+                    && parts[1].bytes().all(|c| c.is_ascii_digit())
+                    && parts[2] == "us-east-2"
+                    && parts[3] == "profiles"
+                    && parts[4].starts_with("us.openai.")
+                    && parts[4]
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b".:-".contains(&c)),
+                "invalid Bedrock selection reference"
+            );
+            return Ok(InferenceDeploymentRef {
+                provider_id: id.into(),
+            });
+        }
         let parts: Vec<_> = id.splitn(4, '/').collect();
         ensure!(
             parts.len() == 4

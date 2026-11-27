@@ -23,7 +23,8 @@ def load(path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     if path.name == "aws_bridge.py":
-        exec(compile((path.parent / "nitro_eks.py").read_text(), "nitro_eks.py", "exec"), module.__dict__)
+        for name in ("nitro_eks.py", "setup.py"):
+            exec(compile((path.parent / name).read_text(), name, "exec"), module.__dict__)
     return module
 
 

@@ -1,5 +1,6 @@
 """Nitro Sandbox Jobs on EKS. Prepended to aws_bridge.py in the executable."""
 import base64
+import hashlib
 import selectors
 import signal
 import ssl
@@ -110,6 +111,9 @@ class NitroEks:
                 and arn[3] == self.region and re.fullmatch(r"[0-9]{12}", arn[4])
                 and arn[5] == "cluster/" + cluster, "unexpected EKS cluster identity")
         require(info.get("status") == "ACTIVE", "Nitro EKS cluster must be active")
+        self.cluster_arn = info["arn"]
+        expected = os.environ.get("MAGICMTN_AWS_NITRO_EKS_CLUSTER_ARN")
+        require(not expected or expected == self.cluster_arn, "Nitro EKS cluster identity changed")
         self.scope = f"nitro-eks/{self.region}/{arn[4]}/{cluster}/{self.namespace}"
         self.endpoint = info["endpoint"]
         parsed = urlsplit(self.endpoint)
@@ -123,7 +127,11 @@ class NitroEks:
                 "unexpected EKS cluster endpoint")
         self.endpoint = self.endpoint.rstrip("/")
         self.ca = info["certificateAuthority"]["data"]
-        context = ssl.create_default_context(cadata=base64.b64decode(self.ca, validate=True).decode())
+        certificate = base64.b64decode(self.ca, validate=True)
+        self.ca_sha256 = hashlib.sha256(certificate).hexdigest()
+        expected_ca = os.environ.get("MAGICMTN_AWS_NITRO_CA_SHA256")
+        require(not expected_ca or expected_ca == self.ca_sha256, "Nitro EKS cluster certificate identity changed")
+        context = ssl.create_default_context(cadata=certificate.decode())
         self.token = nitro_token(cluster) if deadline is None else nitro_token(cluster, deadline)
         self.opener = urllib.request.build_opener(
             NoRedirect(), urllib.request.HTTPSHandler(context=context))
@@ -437,7 +445,10 @@ def nitro_dispatch(request):
         parts = request["template"].split(":", 1)[1].rsplit("|", 1)
         require(len(parts) == 2, "Nitro template requires an OCI image and session UUID")
         image, session = parts
-        require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9/_.:@-]{0,511}", image), "invalid Nitro OCI image")
+        if request["template"].startswith("image:"):
+            mapping = image_mapping(os.environ.get("MAGICMTN_AWS_NITRO_IMAGES", "{}"))
+            image = mapping.get(image, image)
+        require(isinstance(image, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9/_.:@-]{0,511}", image), "invalid Nitro OCI image")
         session = nitro_session(session)
         ttl = request.get("ttl_seconds", 28800)
         require(type(ttl) is int and ttl > 0, "invalid Nitro sandbox TTL")
@@ -458,6 +469,33 @@ def nitro_dispatch(request):
         return api.execute(job_name, uid, request, deadline)
     api = NitroEks()
     job_name, uid = api.reference(request["sandbox"])
+    if op == "sandbox_status":
+        job = api.request("GET", api.jobs + "/" + job_name, allow_missing=True)
+        if job is None:
+            return "missing"
+        api.owned_job(job, uid)
+        if job.get("metadata", {}).get("deletionTimestamp"):
+            raise ProviderFailure("Nitro sandbox is terminating", "upstream_unavailable")
+        for condition in job.get("status", {}).get("conditions", []):
+            if condition.get("status") == "True":
+                if condition.get("type") in ("Failed", "Complete"):
+                    return "stopped"
+                if condition.get("type") in ("FailureTarget", "SuccessCriteriaMet"):
+                    raise ProviderFailure("Nitro sandbox is finishing", "upstream_unavailable")
+        result = api.request("GET", api.pods + "?" + urlencode({"labelSelector": "job-name=" + job_name}))
+        pods = result.get("items")
+        require(isinstance(pods, list), "invalid Nitro pod inventory")
+        ready = []
+        for pod in pods:
+            candidate, reason = api.pod_observation(pod, uid)
+            if candidate:
+                ready.append(candidate)
+            if reason:
+                raise ProviderFailure(reason, "upstream_unavailable")
+        require(len(ready) <= 1, "multiple Nitro sandbox pods are ready")
+        if ready:
+            return "running"
+        raise ProviderFailure(NITRO_NOT_READY, "upstream_unavailable")
     if op == "terminate":
         job = api.request("GET", api.jobs + "/" + job_name, allow_missing=True)
         if job is not None:
